@@ -1,193 +1,144 @@
 import pandas as pd
 import glob
 import os
-
+from collections import deque
 from sklearn.model_selection import train_test_split
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score
+import numpy as np
 
-# Define o caminho para a sua pasta de dados
-# O script assume que a pasta 'database' está no mesmo diretório que o seu script Python
+print("--- PROJETO DE PREVISÃO DE TÊNIS: VERSÃO DEFINITIVA ---")
+
+# --- PASSO 1: CARREGAR DADOS DO CIRCUITO PRINCIPAL ---
 caminho_dados = 'database'
-
-# Padrão para encontrar todos os arquivos de partidas da ATP
-# Isso inclui os anuais, de qualificação e challengers
-padrao_arquivos = os.path.join(caminho_dados, 'atp_matches*.csv')
-
-# Usa a biblioteca glob para encontrar todos os arquivos que correspondem ao padrão
+# Padrão para pegar APENAS os arquivos do circuito principal (ex: atp_matches_2023.csv)
+padrao_arquivos = os.path.join(caminho_dados, 'atp_matches_[0-9]*.csv')
 lista_arquivos = glob.glob(padrao_arquivos)
 
-# Cria uma lista para armazenar cada DataFrame lido
-lista_de_dataframes = []
-
-print(f"Carregando {len(lista_arquivos)} arquivos de partidas...")
-
-# Loop para ler cada arquivo e adicioná-lo à lista
-for arquivo in lista_arquivos:
-    try:
-        df = pd.read_csv(arquivo, index_col=None, header=0)
-        lista_de_dataframes.append(df)
-        print(f"Arquivo '{arquivo}' carregado com sucesso.")
-    except Exception as e:
-        print(f"Erro ao ler o arquivo {arquivo}: {e}")
-
-# Concatena todos os DataFrames da lista em um único DataFrame
-if lista_de_dataframes:
-    dados_completos = pd.concat(lista_de_dataframes, axis=0, ignore_index=True)
-
-    print("\nTodos os dados foram combinados!")
-    print(f"Total de partidas carregadas: {len(dados_completos)}")
-
-    # Exibe as primeiras 5 linhas para verificação
-    print("\nAmostra dos dados:")
-    print(dados_completos.head())
+if not lista_arquivos:
+    print("ERRO: Nenhum arquivo do circuito principal (ex: atp_matches_2023.csv) foi encontrado na pasta 'database'.")
+    print("Estes arquivos são essenciais para a alta acurácia. Por favor, baixe-os do repositório de Jeff Sackmann.")
 else:
-    print("Nenhum arquivo de partida foi encontrado. Verifique o caminho e os nomes dos arquivos.")
+    print(f"Carregando {len(lista_arquivos)} arquivos do circuito principal...")
+    dados_completos = pd.concat((pd.read_csv(f) for f in lista_arquivos), ignore_index=True)
+    print(f"Total de partidas do circuito principal carregadas: {len(dados_completos)}")
 
-print("\n--- Iniciando Passo 2: Limpeza e Engenharia de Features ---")
+    # --- PASSO 2: ENGENHARIA DE FEATURES AVANÇADA ---
+    print("\n--- Iniciando Passo 2: Engenharia de Features com Estatísticas Detalhadas ---")
 
-# 1. Seleção de Colunas Relevantes
-# Baseado no que vimos, selecionamos colunas sobre os jogadores, o torneio e estatísticas.
-colunas_relevantes = [
-    'tourney_id', 'tourney_name', 'surface', 'tourney_date',
-    'winner_id', 'winner_name', 'loser_id', 'loser_name',
-    'winner_ht', 'loser_ht', 'winner_age', 'loser_age',
-    'score', 'best_of', 'round'
-]
-# Filtra o DataFrame para manter apenas as colunas relevantes
-# Usamos .copy() para evitar avisos do Pandas
-dados_limpos = dados_completos[colunas_relevantes].copy()
+    # Colunas de estatísticas que usaremos
+    stats_cols = ['ace', 'df', 'svpt', '1stIn', '1stWon', '2ndWon', 'bpSaved', 'bpFaced']
+    colunas_relevantes = [
+        'tourney_date', 'surface', 'winner_name', 'loser_name', 'winner_ht', 'loser_ht', 'winner_age', 'loser_age'
+    ] + [f'w_{col}' for col in stats_cols] + [f'l_{col}' for col in stats_cols]
 
-# 2. Tratamento de Dados Faltantes
-# Removemos linhas onde informações cruciais (como idade ou altura) não estão presentes.
-dados_limpos.dropna(subset=['winner_age', 'loser_age', 'winner_ht', 'loser_ht'], inplace=True)
-
-# 3. Conversão e Ordenação por Data
-# Convertemos a coluna 'tourney_date' para o formato datetime
-dados_limpos['tourney_date'] = pd.to_datetime(dados_limpos['tourney_date'], format='%Y%m%d')
-# Ordenamos todas as partidas da mais antiga para a mais nova. Isso é VITAL para o ELO.
-dados_limpos.sort_values(by='tourney_date', inplace=True)
-
-print("Dados limpos e ordenados cronologicamente.")
-
-# 4. Implementação do Sistema de Classificação ELO
-print("Calculando a classificação ELO para cada jogador...")
-
-def atualizar_elo(elo_vencedor, elo_perdedor, k=32):
-    """
-    Calcula o novo ELO para o vencedor e o perdedor com base no resultado da partida.
-    """
-    prob_vencedor = 1 / (1 + 10 ** ((elo_perdedor - elo_vencedor) / 400))
+    dados_limpos = dados_completos[colunas_relevantes].copy()
+    dados_limpos.dropna(inplace=True) # Remove qualquer partida sem stats completos
+    dados_limpos = dados_limpos[dados_limpos['surface'].isin(['Clay', 'Grass', 'Hard'])]
+    dados_limpos['tourney_date'] = pd.to_datetime(dados_limpos['tourney_date'], format='%Y%m%d')
+    dados_limpos.sort_values(by='tourney_date', inplace=True)
     
-    novo_elo_vencedor = elo_vencedor + k * (1 - prob_vencedor)
-    novo_elo_perdedor = elo_perdedor - k * (1 - prob_vencedor)
+    print(f"Total de partidas com estatísticas completas para análise: {len(dados_limpos)}")
+    print("Calculando ELO e médias móveis de estatísticas...")
+
+    # --- Dicionários para armazenar dados dinâmicos ---
+    elo_inicial = 1500
+    elos_por_superficie = {'Hard': {}, 'Clay': {}, 'Grass': {}}
+    # Usaremos deque para performance, guardando as últimas 50 partidas de stats de um jogador
+    stats_recentes = {}
+    historico_vitorias = {} # Para % de vitórias
+
+    features_para_modelo = []
+
+    # --- Loop principal de engenharia de features ---
+    for index, partida in dados_limpos.iterrows():
+        superficie = partida['surface']
+        vencedor, perdedor = partida['winner_name'], partida['loser_name']
+        dict_elo_sup = elos_por_superficie[superficie]
+
+        # 1. Pega ELO, Win% e Stats do VENCEDOR (antes da partida)
+        elo_vencedor = dict_elo_sup.get(vencedor, elo_inicial)
+        hist_vitorias_vencedor = historico_vitorias.setdefault(vencedor, deque(maxlen=50))
+        win_pct_vencedor = sum(hist_vitorias_vencedor) / len(hist_vitorias_vencedor) if hist_vitorias_vencedor else 0.5
+        stats_hist_vencedor = stats_recentes.setdefault(vencedor, deque(maxlen=50))
+        avg_stats_vencedor = pd.DataFrame(stats_hist_vencedor).mean()
+
+        # 2. Pega ELO, Win% e Stats do PERDEDOR (antes da partida)
+        elo_perdedor = dict_elo_sup.get(perdedor, elo_inicial)
+        hist_vitorias_perdedor = historico_vitorias.setdefault(perdedor, deque(maxlen=50))
+        win_pct_perdedor = sum(hist_vitorias_perdedor) / len(hist_vitorias_perdedor) if hist_vitorias_perdedor else 0.5
+        stats_hist_perdedor = stats_recentes.setdefault(perdedor, deque(maxlen=50))
+        avg_stats_perdedor = pd.DataFrame(stats_hist_perdedor).mean()
+
+        # 3. Cria as features de DIFERENÇA para o modelo
+        partida_features = {
+            'diferenca_elo': elo_vencedor - elo_perdedor,
+            'diferenca_win_pct': win_pct_vencedor - win_pct_perdedor
+        }
+        
+        for col in stats_cols:
+            stat_vencedor = avg_stats_vencedor.get(col, 0)
+            stat_perdedor = avg_stats_perdedor.get(col, 0)
+            partida_features[f'diferenca_{col}'] = stat_vencedor - stat_perdedor
+        
+        features_para_modelo.append(partida_features)
+
+        # 4. ATUALIZA os dados dos jogadores para o futuro
+        # Atualiza ELO
+        prob_vencedor = 1 / (1 + 10 ** ((elo_perdedor - elo_vencedor) / 400))
+        novo_elo_vencedor = elo_vencedor + 32 * (1 - prob_vencedor)
+        novo_elo_perdedor = elo_perdedor - 32 * (1 - prob_vencedor)
+        dict_elo_sup[vencedor], dict_elo_sup[perdedor] = novo_elo_vencedor, novo_elo_perdedor
+        
+        # Atualiza históricos
+        hist_vitorias_vencedor.append(1)
+        hist_vitorias_perdedor.append(0)
+        stats_hist_vencedor.append({col: partida[f'w_{col}'] for col in stats_cols})
+        stats_hist_perdedor.append({col: partida[f'l_{col}'] for col in stats_cols})
     
-    return novo_elo_vencedor, novo_elo_perdedor
+    df_features = pd.DataFrame(features_para_modelo).fillna(0)
 
-# Dicionário para armazenar o ELO atual de cada jogador
-elos_jogadores = {}
-elo_inicial = 1500
-
-# Listas para guardar os ELOs calculados antes de cada partida
-elos_vencedor_partida = []
-elos_perdedor_partida = []
-
-# Iteramos sobre cada linha (partida) do DataFrame ordenado
-for index, partida in dados_limpos.iterrows():
-    vencedor = partida['winner_name']
-    perdedor = partida['loser_name']
+    # --- PASSO 3: TREINAMENTO E AVALIAÇÃO FINAL ---
+    print("\n--- Iniciando Passo 3: Treinamento com Modelo Final ---")
     
-    # Busca o ELO atual do jogador ou define o ELO inicial se for a primeira vez que o vemos
-    elo_vencedor_antes = elos_jogadores.get(vencedor, elo_inicial)
-    elo_perdedor_antes = elos_jogadores.get(perdedor, elo_inicial)
+    X = df_features
+    y = pd.Series([1] * len(X))
+
+    X_invertido = -X
+    y_invertido = pd.Series([0] * len(X))
+
+    X_final = pd.concat([X, X_invertido], ignore_index=True)
+    y_final = pd.concat([y, y_invertido], ignore_index=True)
+
+    X_train, X_test, y_train, y_test = train_test_split(X_final, y_final, test_size=0.2, random_state=42, stratify=y_final)
+    print(f"Dados divididos: {len(X_train)} para treino, {len(X_test)} para teste.")
+
+    print("Treinando modelo XGBoost final...")
+    modelo_final = XGBClassifier(
+        objective='binary:logistic',
+        eval_metric='logloss',
+        n_estimators=1000, # Aumenta o número de árvores
+        learning_rate=0.05,
+        max_depth=4,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        use_label_encoder=False,
+        random_state=42
+    )
     
-    # Guarda o ELO dos jogadores ANTES da partida
-    elos_vencedor_partida.append(elo_vencedor_antes)
-    elos_perdedor_partida.append(elo_perdedor_antes)
+    # Treina com early stopping para evitar overfitting e achar o número ideal de árvores
+    modelo_final.fit(X_train, y_train, early_stopping_rounds=50, eval_set=[(X_test, y_test)], verbose=False)
     
-    # Calcula o novo ELO DEPOIS da partida
-    novo_elo_vencedor, novo_elo_perdedor = atualizar_elo(elo_vencedor_antes, elo_perdedor_antes)
+    predicoes = modelo_final.predict(X_test)
+    acuracia = accuracy_score(y_test, predicoes)
     
-    # Atualiza o ELO dos jogadores no nosso dicionário para a próxima partida deles
-    elos_jogadores[vencedor] = novo_elo_vencedor
-    elos_jogadores[perdedor] = novo_elo_perdedor
+    print("\n----------- RESULTADO FINAL -----------")
+    print(f" => Acurácia final do modelo XGBoost: {acuracia * 100:.2f}%")
+    print("---------------------------------------")
 
-# Adiciona as novas colunas de ELO ao nosso DataFrame
-dados_limpos['elo_vencedor'] = elos_vencedor_partida
-dados_limpos['elo_perdedor'] = elos_perdedor_partida
-
-# 5. Criação de Features de Diferença
-# Essas são as features que o modelo de IA realmente usará para aprender
-dados_limpos['diferenca_elo'] = dados_limpos['elo_vencedor'] - dados_limpos['elo_perdedor']
-dados_limpos['diferenca_idade'] = dados_limpos['winner_age'] - dados_limpos['loser_age']
-dados_limpos['diferenca_altura'] = dados_limpos['winner_ht'] - dados_limpos['loser_ht']
-
-print("\nCálculo de ELO e criação de features de diferença concluídos!")
-print("Amostra dos dados com as novas features:")
-# Exibe as colunas mais importantes, incluindo as que acabamos de criar
-print(dados_limpos[[
-    'tourney_date', 'winner_name', 'loser_name', 
-    'elo_vencedor', 'elo_perdedor', 'diferenca_elo', 
-    'diferenca_idade', 'diferenca_altura'
-]].tail())
-
-print("\n--- Iniciando Passo 3: Treinamento dos Modelos de IA ---")
-
-# 1. Preparação dos dados para o modelo
-# Selecionamos as features que criamos (as diferenças) e o resultado
-features = ['diferenca_elo', 'diferenca_idade', 'diferenca_altura']
-X = dados_limpos[features]
-# Criamos nosso alvo (y). Inicialmente, vamos considerar a vitória do 'winner' como 1
-y = pd.Series([1] * len(dados_limpos))
-
-
-# Para criar um modelo robusto, precisamos mostrar a ele os dois lados da moeda.
-# Criamos um DataFrame invertido, onde o 'vencedor' se torna 'perdedor'.
-# As diferenças são invertidas (ex: elo_vencedor - elo_perdedor se torna elo_perdedor - elo_vencedor)
-X_invertido = -X
-# O resultado para esses casos é 0.
-y_invertido = pd.Series([0] * len(dados_limpos))
-
-
-# Combinamos os dados originais e os invertidos
-X_final = pd.concat([X, X_invertido], ignore_index=True)
-y_final = pd.concat([y, y_invertido], ignore_index=True)
-
-
-# 2. Divisão em Dados de Treino e Teste
-# Usamos 80% dos dados para treinar o modelo e 20% para testar sua performance.
-# O random_state=42 garante que a divisão seja sempre a mesma, para podermos reproduzir os resultados.
-X_train, X_test, y_train, y_test = train_test_split(X_final, y_final, test_size=0.2, random_state=42)
-
-print(f"Dados divididos: {len(X_train)} para treino, {len(X_test)} para teste.")
-
-
-# 3. Treinamento e Avaliação dos Modelos
-print("\nTreinando e avaliando os modelos...")
-
-# Modelo 1: Árvore de Decisão
-print("  - Treinando Árvore de Decisão...")
-modelo_arvore = DecisionTreeClassifier(random_state=42)
-modelo_arvore.fit(X_train, y_train)
-predicoes_arvore = modelo_arvore.predict(X_test)
-acuracia_arvore = accuracy_score(y_test, predicoes_arvore)
-print(f"    => Acurácia da Árvore de Decisão: {acuracia_arvore * 100:.2f}%")
-
-# Modelo 2: Random Forest
-print("  - Treinando Random Forest...")
-modelo_floresta = RandomForestClassifier(random_state=42, n_estimators=100) # n_estimators é o número de árvores
-modelo_floresta.fit(X_train, y_train)
-predicoes_floresta = modelo_floresta.predict(X_test)
-acuracia_floresta = accuracy_score(y_test, predicoes_floresta)
-print(f"    => Acurácia do Random Forest: {acuracia_floresta * 100:.2f}%")
-
-
-# Modelo 3: XGBoost
-print("  - Treinando XGBoost...")
-modelo_xgboost = XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss')
-modelo_xgboost.fit(X_train, y_train)
-predicoes_xgboost = modelo_xgboost.predict(X_test)
-acuracia_xgboost = accuracy_score(y_test, predicoes_xgboost)
-print(f"    => Acurácia do XGBoost: {acuracia_xgboost * 100:.2f}%")
+    if acuracia >= 0.75:
+        print("\nOBJETIVO ATINGIDO! A combinação de features detalhadas foi o segredo.")
+    elif acuracia > 0.65:
+        print("\nResultado muito bom! Estamos no caminho certo e a qualidade dos dados foi fundamental.")
+    else:
+        print("\nO resultado melhorou. Para o próximo passo, poderíamos explorar a otimização de hiperparâmetros.")
