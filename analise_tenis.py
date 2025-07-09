@@ -119,7 +119,7 @@ else:
         eval_metric='logloss',
         n_estimators=1000, # Aumenta o número de árvores
         learning_rate=0.05,
-        max_depth=4,
+        max_depth=8,
         subsample=0.8,
         colsample_bytree=0.8,
         use_label_encoder=False,
